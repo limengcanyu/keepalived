@@ -47,6 +47,7 @@
 #include "smtp.h"
 #include "utils.h"
 #include "logger.h"
+#include "bitops.h"
 #ifdef _WITH_FIREWALL_
 #include "vrrp_firewall.h"
 #endif
@@ -74,6 +75,7 @@ use_polling_handler(const vector_t *strvec)
 	global_data->linkbeat_use_polling = true;
 }
 #endif
+
 static void
 save_process_name(char const **dest, const char *src)
 {
@@ -425,6 +427,7 @@ checker_log_all_failures_handler(const vector_t *strvec)
 	global_data->checker_log_all_failures = res;
 }
 #endif
+
 #ifdef _WITH_VRRP_
 static void
 default_interface_handler(const vector_t *strvec)
@@ -905,6 +908,30 @@ vrrp_min_garp_handler(const vector_t *strvec)
 	if (global_data->vrrp_garp_delay == VRRP_GARP_DELAY)
 		global_data->vrrp_garp_delay = 0;
 }
+#ifdef _HAVE_VRRP_VMAC_
+static void
+vrrp_vmac_garp_intvl_handler(const vector_t *strvec)
+{
+	unsigned delay = 0;
+	unsigned index;
+
+	for (index = 1; index < vector_size(strvec); index++) {
+		if (!strcmp(strvec_slot(strvec, index), "all"))
+			global_data->vrrp_vmac_garp_all_if = true;
+		else if (!read_unsigned_strvec(strvec, index, &delay, 1, 86400, true)) {
+			report_config_error(CONFIG_GENERAL_ERROR, "vrrp_vmac_garp_intvl '%s' invalid - ignoring", strvec_slot(strvec, index));
+			return;
+		}
+	}
+
+	if (!delay) {
+		report_config_error(CONFIG_GENERAL_ERROR, "vrrp_vmac_garp_intvl specified without time - ignoring");
+		return;
+	}
+
+	global_data->vrrp_vmac_garp_intvl = delay;
+}
+#endif
 static void
 vrrp_lower_prio_no_advert_handler(const vector_t *strvec)
 {
@@ -1919,6 +1946,30 @@ vrrp_log_unknown_vrids_handler(__attribute__((unused)) const vector_t *strvec)
 {
 	global_data->log_unknown_vrids = true;
 }
+
+#ifdef _HAVE_VRRP_VMAC_
+static void
+vrrp_vmac_prefix_handler(const vector_t *strvec)
+{
+	if (global_data->vmac_prefix) {
+		report_config_error(CONFIG_GENERAL_ERROR, "vmac prefix has already been specified - ignoring %s", strvec_slot(strvec, 1));
+		return;
+	}
+
+	global_data->vmac_prefix = STRDUP(strvec_slot(strvec, 1));
+}
+
+static void
+vrrp_vmac_addr_prefix_handler(const vector_t *strvec)
+{
+	if (global_data->vmac_addr_prefix) {
+		report_config_error(CONFIG_GENERAL_ERROR, "vmac_addr prefix has already been specified - ignoring %s", strvec_slot(strvec, 1));
+		return;
+	}
+
+	global_data->vmac_addr_prefix = STRDUP(strvec_slot(strvec, 1));
+}
+#endif
 #endif
 
 static void
@@ -1936,16 +1987,25 @@ random_seed_handler(const vector_t *strvec)
 
 #ifndef _ONE_PROCESS_DEBUG_
 static void
+reload_check_config_handler(const vector_t *strvec)
+{
+	if (vector_size(strvec) >= 2) {
+		FREE_CONST_PTR(global_data->reload_check_config);
+		global_data->reload_check_config = set_value(strvec);
+
+		/* Check file can be written */
+	} else
+		global_data->reload_check_config = STRDUP("/dev/null");
+}
+
+static void
 reload_time_file_handler(const vector_t *strvec)
 {
-	char *str;
-
 	if (vector_size(strvec) != 2) {
 		report_config_error(CONFIG_GENERAL_ERROR, "reload_time_file invalid");
 		return;
 	}
-	global_data->reload_time_file = str = MALLOC(strlen(strvec_slot(strvec, 1)) + 1);
-	strcpy(str, strvec_slot(strvec, 1));
+	global_data->reload_time_file = STRDUP(strvec_slot(strvec, 1));
 }
 
 static void
@@ -1953,7 +2013,37 @@ reload_repeat_handler(__attribute__((unused)) const vector_t *strvec)
 {
 	global_data->reload_repeat = true;
 }
+
+static void
+reload_file_handler(const vector_t *strvec)
+{
+	if (global_data->reload_file && global_data->reload_file != DEFAULT_RELOAD_FILE)
+		FREE_CONST_PTR(global_data->reload_file);
+
+	if (vector_size(strvec) >= 2)
+		global_data->reload_file = STRDUP(strvec_slot(strvec, 1));
+	else
+		global_data->reload_file = DEFAULT_RELOAD_FILE;
+}
 #endif
+
+static void
+config_copy_directory_handler(const vector_t *strvec)
+{
+	if (global_data->config_directory) {
+		report_config_error(CONFIG_GENERAL_ERROR, "%s already specified - ignoring", strvec_slot(strvec, 0));
+		return;
+	}
+
+	if (vector_size(strvec) >= 2) {
+		global_data->config_directory = STRDUP(strvec_slot(strvec, 1));
+
+		/* Copy the configuration read so far to the new location */
+		if (!reload && !__test_bit(CONFIG_TEST_BIT, &debug))
+			use_disk_copy_for_config(global_data->config_directory);
+	} else
+		report_config_error(CONFIG_GENERAL_ERROR, "%s missing directory name", strvec_slot(strvec, 0));
+}
 
 void
 init_global_keywords(bool global_active)
@@ -2028,6 +2118,9 @@ init_global_keywords(bool global_active)
 	install_keyword("vrrp_garp_interval", &vrrp_garp_interval_handler);
 	install_keyword("vrrp_gna_interval", &vrrp_gna_interval_handler);
 	install_keyword("vrrp_min_garp", &vrrp_min_garp_handler);
+#ifdef _HAVE_VRRP_VMAC_
+	install_keyword("vrrp_vmac_garp_intvl", &vrrp_vmac_garp_intvl_handler);
+#endif
 	install_keyword("vrrp_lower_prio_no_advert", &vrrp_lower_prio_no_advert_handler);
 	install_keyword("vrrp_higher_prio_send_advert", &vrrp_higher_prio_send_advert_handler);
 	install_keyword("vrrp_version", &vrrp_version_handler);
@@ -2135,11 +2228,18 @@ init_global_keywords(bool global_active)
 	install_keyword("vrrp_rx_bufs_multiplier", &vrrp_rx_bufs_multiplier_handler);
 	install_keyword("vrrp_startup_delay", &vrrp_startup_delay_handler);
 	install_keyword("log_unknown_vrids", &vrrp_log_unknown_vrids_handler);
+#ifdef _HAVE_VRRP_VMAC_
+	install_keyword("vmac_prefix", &vrrp_vmac_prefix_handler);
+	install_keyword("vmac_addr_prefix", &vrrp_vmac_addr_prefix_handler);
+#endif
 #endif
 	install_keyword("umask", &umask_handler);
 	install_keyword("random_seed", &random_seed_handler);
 #ifndef _ONE_PROCESS_DEBUG_
+	install_keyword("reload_check_config", &reload_check_config_handler);
 	install_keyword("reload_time_file", &reload_time_file_handler);
 	install_keyword("reload_repeat", &reload_repeat_handler);
+	install_keyword("reload_file", &reload_file_handler);
 #endif
+	install_keyword("tmp_config_directory", &config_copy_directory_handler);
 }

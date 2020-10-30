@@ -41,6 +41,8 @@
 #include <stdarg.h>
 #include <math.h>
 #include <inttypes.h>
+#include <signal.h>
+#include <sys/mman.h>
 
 #include "parser.h"
 #include "memory.h"
@@ -54,11 +56,39 @@
 #include "process.h"
 
 
+/* In order to ensure that all processes read the same configuration, the first
+ * process that reads the configuration writes it to a temporary file, and all
+ * the other processes read that temporary file.
+ *
+ * For simplicity, the temporary file is by default, and if memfd_create() is
+ * supported, a memfd type file, otherwise it will be an anonymous file in the
+ * filesystem that includes /tmp. The default can be overridden by the global_defs
+ * tmp_config_directory option.
+ *
+ * The temporary file contains all the lines of the original configuration file(s)
+ * stripped of leading and training whitespace and comments, with the following
+ * exceptions:
+ * 1. include statements are passed as blank lines.
+ * 2. When an included file is opened, a line starting "# " followed by the file
+ *    name is written.
+ * 3. When an included file is closed, a single character line "!" is written.
+ * 4. Any include file processing errors are written to the file preceeded by "#! ".
+ *
+ * The reasons for 2 and 3 are so that configuration errors can be logged with the
+ * correct file name and line number.
+ * The reason for 4 is so that include file processing errors can be written to the
+ * log files of all processes.
+ */
+
 #define DEF_LINE_END	"\n"
 
 #define BOB "{"
 #define EOB "}"
 #define WHITE_SPACE_STR " \t\f\n\r\v"
+
+/* Some development/test options */
+/* #define LEAVE_FILE */
+
 
 typedef struct _defs {
 	const char *name;
@@ -158,6 +188,10 @@ static unsigned seq_list_count = 0;
 static int kw_level;
 static int block_depth;
 
+static FILE *conf_copy;
+static bool write_conf_copy;
+static bool read_conf_copy;
+
 /* Parameter definitions */
 static LIST_HEAD_INITIALIZE(defs); /* def_t */
 
@@ -166,7 +200,6 @@ static bool replace_param(char *, size_t, char const **);
 
 /* Stack of include files */
 LIST_HEAD_INITIALIZE(include_stack);
-
 
 void
 report_config_error(config_err_t err, const char *format, ...)
@@ -208,6 +241,57 @@ report_config_error(config_err_t err, const char *format, ...)
 
 	if (format_buf)
 		FREE(format_buf);
+}
+
+void
+use_disk_copy_for_config(const char *dir_name)
+{
+	int fd;
+	int fd_mem;
+	char buf[512];
+	ssize_t len;
+	FILE *new_conf_copy;
+
+	if (!write_conf_copy)
+		return;
+
+	fd = open(dir_name, O_RDWR | O_TMPFILE | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+	if (fd == -1) {
+		report_config_error(CONFIG_GENERAL_ERROR, "Cannot open config directory %s for writing, errno %d - %m", dir_name, errno);
+		return;
+	}
+
+	/* Copy what we have already written to the disk based file */
+	rewind(conf_copy);
+	fd_mem = fileno(conf_copy);
+	lseek(fd_mem, 0L, SEEK_SET);
+
+	while ((len = read(fd_mem, buf, sizeof(buf))) > 0) {
+		if (write(fd, buf, len) != len)
+			break;
+	}
+
+	if (len) {
+		log_message(LOG_INFO, "Unable to config to new disk file on %s", dir_name);
+		close(fd);
+		return;
+	}
+
+	new_conf_copy = fdopen(fd, "a+");
+	if (!new_conf_copy) {
+		log_message(LOG_INFO, "fdopen of disk file error %d - %m", errno);
+		close(fd);
+		return;
+	}
+
+	fclose(conf_copy);
+	conf_copy = new_conf_copy;
+}
+
+void
+clear_config_status(void)
+{
+	config_err = CONFIG_OK;
 }
 
 config_err_t __attribute__ ((pure))
@@ -435,6 +519,170 @@ bool
 read_unsigned_base_strvec(const vector_t *strvec, size_t index, int base, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
 {
 	return read_unsigned_func(strvec_slot(strvec, index), base, res, min_val, max_val, ignore_error);
+}
+
+/* Read a fractional decimal with up to shift decimal places. Return value * 10^shift. For example to read 3.312 as milliseconds, but
+ * return 3312, as micro-seconds, specify a shift value of 3 (i.e. 10^3 = 1000). The min_val and max_val are in the units of the returned value.
+ */
+bool
+read_decimal_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res, unsigned min_val, unsigned max_val, unsigned shift, bool ignore_error)
+{
+	const char *param = strvec_slot(strvec, index);
+	size_t param_len = strlen(param);
+	char *updated_param;
+	const char *dp;
+	unsigned num_dp;
+	const char *warn = "";
+	bool ret;
+	unsigned i;
+	bool round_up = false;
+
+#ifndef _STRICT_CONFIG_
+	if (ignore_error && !__test_bit(CONFIG_TEST_BIT, &debug))
+		warn = "WARNING - ";
+#endif
+
+	/* Make sure we don't have too many decimal places */
+	dp = strchr(param, '.');
+	num_dp = dp ? param_len - (dp - param) - 1 : 0;
+	if (num_dp > shift) {
+		report_config_error(CONFIG_INVALID_NUMBER, "%snumber '%s' has too many decimal places", warn, param);
+		round_up = dp[shift + 1] >= '5';
+		num_dp = shift;
+	}
+
+	updated_param = MALLOC(param_len + shift + 1);	/* Allow to add shift trailing 0's and '\0' */
+
+	if (dp) {
+		strncpy(updated_param, param, dp - param);
+		strncpy(updated_param + (dp - param), dp + 1, num_dp);
+		updated_param[dp - param + num_dp] = '\0';
+	} else
+		strcpy(updated_param, param);
+
+	/* Add any necessary trailing 0s */
+	num_dp = shift - num_dp;
+	for (i = 0; i < num_dp; i++)
+		strcat(updated_param, "0");
+
+	ret = read_unsigned_func(updated_param, 10, res, min_val, max_val, ignore_error);
+
+	FREE(updated_param);
+
+	if (round_up)
+		*res += 1;
+
+	return ret;
+}
+
+/* read_hex_str() reads a hex string, which can include spaces, and saves the string in
+ * MALLOC'd memory at data.
+ * Hex characters 0-9, A-F and a-f are valid.
+ * The string can include wildcard characters, x or X, in which
+ * case mask will be allocated and used to indicate the wildcard half octets (nibbles)
+ */
+static uint8_t
+hex_val(char p, bool allow_wildcard)
+{
+	if (p >= '0' && p <= '9')
+		return p - '0';
+	if (p >= 'a')
+		p -= ('a' - 'A');
+	if (p >= 'A' && p <= 'F')
+		return p - 'A' + 10;
+
+	if (allow_wildcard && p == 'X')
+		return 0xfe;
+
+	return 0xff;
+}
+
+uint16_t
+read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
+{
+	size_t str_len;
+	uint8_t *buf;
+	uint8_t *mask;
+	const char *p = str;
+	uint8_t val = 0;
+	uint8_t val1;
+	uint8_t mask_val;
+	bool using_mask = false;
+	uint16_t len;
+
+	/* The output octet string cannot be longer than (strlen(str) + 1)/2 */
+	str_len = (strlen(str) + 1) / 2;
+	buf = MALLOC(str_len);
+	mask = MALLOC(str_len);
+
+	len = 0;
+	while (true) {
+		/* Skip spaces */
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		if (!*p)
+			break;
+
+		val = hex_val(*p++, !!data_mask);
+		if (val == 0xff)
+			break;
+		if (val == 0xfe) {
+			mask_val = 0x0f;
+			val = 0;
+			using_mask = true;
+		} else
+			mask_val = 0;
+
+		if (*p && *p != ' ') {
+			val1 = val << 4;
+			mask_val <<= 4;
+			val = hex_val(*p++, !!data_mask);
+			if (val == 0xff)
+				break;
+			if (val == 0xfe) {
+				mask_val |= 0x0f;
+				val = 0;
+				using_mask = true;
+			}
+			val |= val1;
+		}
+
+		buf[len] = val;
+		mask[len] = mask_val;
+		len++;
+	}
+
+	if (val == 0xff || !len) {
+		FREE_ONLY(buf);
+		FREE_ONLY(mask);
+		return 0;
+	}
+
+	/* Reduce the buffer size of appropriate */
+	if (len < str_len) {
+		buf = REALLOC(buf, len);
+		if (using_mask)
+			mask = REALLOC(mask, len);
+	}
+
+	*data = buf;
+	if (using_mask)
+		*data_mask = mask;
+	else
+		FREE_ONLY(mask);
+
+#if 0
+	for (int i = 0;  i < len; i++)
+		printf("%2.2X ", buf[i]);
+	printf("\n");
+
+	for (i = 0;  i < len; i++)
+		printf("%2.2X ", mask[i]);
+	printf("\n");
+#endif
+
+	return len;
 }
 
 void
@@ -1178,6 +1426,7 @@ add_lst(char *buf)
 			PMALLOC(value);
 			value->val = STRDUP("");
 			INIT_LIST_HEAD(&value->e_list);
+			list_add_tail(&value->e_list, &value_set->values);
 		}
 
 		/* Add the value_set to the list of value_sets */
@@ -1249,7 +1498,7 @@ check_conf_file(const char *conf_file)
 		}
 
 		if (access(globbuf.gl_pathv[i], R_OK)) {
-			log_message(LOG_INFO, "Unable to read configuration file %s", globbuf.gl_pathv[i]);
+			report_config_error(CONFIG_FILE_NOT_FOUND, "Unable to read configuration file %s", globbuf.gl_pathv[i]);
 			ret = false;
 			break;
 		}
@@ -1258,7 +1507,7 @@ check_conf_file(const char *conf_file)
 		if (stat(globbuf.gl_pathv[i], &stb) ||
 		    !S_ISREG(stb.st_mode) ||
 		     (stb.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
-			log_message(LOG_INFO, "Configuration file '%s' is not a regular non-executable file", globbuf.gl_pathv[i]);
+			report_config_error(CONFIG_FILE_NOT_FOUND, "Configuration file '%s' is not a regular non-executable file", globbuf.gl_pathv[i]);
 			ret = false;
 			break;
 		}
@@ -1820,11 +2069,15 @@ open_conf_file(include_file_t *file)
 			continue;
 		}
 
+		/* Allow tracking of file names/numbers */
+		if (write_conf_copy)
+			fprintf(conf_copy, "# %s\n", file->globbuf.gl_pathv[i]);
+
 		file->stream = stream;
 		file->num_matches++;
 
 		/* We only want to report the file name if there is more than one file used */
-		if (!list_is_last(&include_stack, &file->e_list) || file->globbuf.gl_pathc > 1)
+		if (!list_is_last(&file->e_list, &include_stack) || file->globbuf.gl_pathc > 1)
 			file->current_file_name = file->globbuf.gl_pathv[i];
 		file->current_line_no = 0;
 
@@ -1887,6 +2140,7 @@ open_glob_file(const char *conf_file)
 	}
 
 	file->file_name = STRDUP(conf_file);
+
 	list_head_add(&file->e_list, &include_stack);
 
 	return true;
@@ -1897,7 +2151,8 @@ end_file(include_file_t *file)
 {
 	int res;
 
-	fclose(file->stream);
+	if (file->stream != conf_copy)
+		fclose(file->stream);
 
 // WHY??
 //	free_seq_list(&seq_list);
@@ -1944,6 +2199,11 @@ get_next_file(void)
 
 	file = list_first_entry(&include_stack, include_file_t, e_list);
 
+	if (write_conf_copy) {
+		/* Indicate a file is being closed */
+		fprintf(conf_copy, "!\n");
+	}
+
 	return true;
 }
 
@@ -1952,8 +2212,7 @@ check_include(const char *buf)
 {
 	const char *p;
 
-	if (strncmp(buf, "include", 7) ||
-	    (buf[7] != ' ' && buf[7] != '\t'))
+	if (strncmp(buf, "include", 7) || !isspace(buf[7]))
 		return false;
 
 	p = buf + 8;
@@ -2055,6 +2314,14 @@ read_line(char *buf, size_t size)
 			}
 		} else {
 			/* Get the next non-blank line */
+
+			/* Check we haven't completed all the files */
+			if (list_empty(&include_stack)) {
+				eof = true;
+				buf[0] = '\0';
+				break;
+			}
+
 			file = list_first_entry(&include_stack, include_file_t, e_list);
 
 			do {
@@ -2069,6 +2336,59 @@ read_line(char *buf, size_t size)
 					eof = true;
 					buf[0] = '\0';
 					break;
+				}
+
+				if (read_conf_copy) {
+					if (buf[0] == '#') {
+						FILE *fps = file->stream;
+
+						PMALLOC(file);
+						INIT_LIST_HEAD(&file->e_list);
+
+						file->stream = fps;
+						file->globbuf.gl_offs = 0;
+						file->num_matches = 1;
+						buf[strlen(buf) - 1] = '\0';
+						file->file_name = STRDUP(buf + 2);
+						file->current_file_name = file->file_name;
+						list_head_add(&file->e_list, &include_stack);
+						if (strchr(file->current_file_name, '/')) {
+							/* If the filename contains a directory element, change to that directory.
+							   The man page open(2) states that fchdir() didn't support O_PATH until Linux 3.5,
+							   even though testing on Linux 3.1 shows it appears to work. To be safe, don't
+							   use it until Linux 3.5. */
+							file->curdir_fd = open(".", O_RDONLY | O_DIRECTORY
+#if HAVE_DECL_O_PATH && LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
+												     | O_PATH
+#endif
+													     );
+
+							char *confpath = STRDUP(buf + 2);
+							dirname(confpath);
+							if (chdir(confpath) < 0)
+								log_message(LOG_INFO, "chdir(%s) error (%s)", confpath, strerror(errno));
+							FREE(confpath);
+						} else
+							file->curdir_fd = -1;
+
+						buf[0] = '\0';
+						continue;
+					} else if (buf[0] == '!') {
+						if (file->curdir_fd != -1) {
+							if (fchdir(file->curdir_fd))
+								log_message(LOG_INFO, "Failed to restore previous directory after include");
+							close(file->curdir_fd);
+						}
+						file = list_first_entry(&include_stack, include_file_t, e_list);
+						FREE_CONST_PTR(file->current_file_name);
+
+						list_del_init(&file->e_list);
+						FREE(file);
+						file = list_first_entry(&include_stack, include_file_t, e_list);
+
+						buf[0] = '\0';
+						continue;
+					}
 				}
 
 				/* Check if we have read the end of a line */
@@ -2089,10 +2409,23 @@ read_line(char *buf, size_t size)
 				}
 
 				buf[len] = '\0';
-				if (!len)
+				if (!len) {
+					/* We need to preserve line numbers */
+					if (write_conf_copy)
+						fprintf(conf_copy, "\n");
 					continue;
+				}
 
 				decomment(buf);
+
+				if (write_conf_copy) {
+					if (strncmp(buf, "include", 7) || !isspace(buf[7]))
+						fprintf(conf_copy, "%s\n", buf);
+					else {
+						/* We need to preserve line numbers */
+						fprintf(conf_copy, "\n");
+					}
+				}
 			} while (!buf[0]);
 
 			if (!buf[0])
@@ -2500,15 +2833,17 @@ process_stream(vector_t *keywords_vec, int need_bob)
 
 /* Data initialization */
 void
-init_data(const char *conf_file, const vector_t * (*init_keywords) (void))
+init_data(const char *conf_file, const vector_t * (*init_keywords) (void), bool copy_config)
 {
+	bool file_opened = false;
+	int fd;
+
 	/* A parent process or previous config load may have left these set */
 	block_depth = 0;
 	kw_level = 0;
 	sublevel = 0;
 	skip_sublevel = 0;
 	multiline_seq_depth = 0;
-	config_err = CONFIG_OK;
 	random_seed = 0;
 	random_seed_configured = false;
 
@@ -2529,9 +2864,59 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void))
 	/* Stream handling */
 	current_keywords = keywords;
 
-	/* Open the first file */
-	if (open_glob_file(conf_file)) {
+	if (copy_config) {
+		if (!conf_copy) {
+#ifdef HAVE_MEMFD_CREATE
+			fd = memfd_create("/keepalived/consolidated_configuration", MFD_CLOEXEC);
+#else
+			fd = open("/tmp", O_RDWR | O_TMPFILE | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+#endif
+			if (fd == -1)
+				log_message(LOG_INFO, "memfd_create error %d - %m", errno);
+			else {
+				conf_copy = fdopen(fd, "w+");
+				if (!conf_copy)
+					log_message(LOG_INFO, "fdopen of memfd_create error %d - %m", errno);
+			}
+		}
+		else  {
+#ifdef LEAVE_FILE
+			if (ftruncate(fileno(conf_copy), 0))
+				log_message(LOG_INFO, "Failed to truncate config copy file (%d) - %m", errno);
+#endif
 
+			rewind(conf_copy);
+		}
+		write_conf_copy = true;
+	}
+
+	if (!copy_config && conf_copy) {
+		include_file_t *file;
+
+		PMALLOC(file);
+		INIT_LIST_HEAD(&file->e_list);
+
+		file->globbuf.gl_offs = 0;
+		file->stream = conf_copy;
+		file->num_matches = 1;
+		file->curdir_fd = -1;
+		errno = 0;
+		rewind(conf_copy);
+		if (errno)
+			log_message(LOG_INFO, "rewind config file failed (%d) - %m", errno);
+		file->file_name = STRDUP(conf_file);
+		file->current_file_name = file->file_name;
+
+		list_head_add(&file->e_list, &include_stack);
+
+		read_conf_copy = true;
+		file_opened = true;
+	} else if (open_glob_file(conf_file)) {
+		/* Opened the first file */
+		file_opened = true;
+	}
+
+	if (file_opened) {
 		register_null_strvec_handler(null_strvec);
 		process_stream(current_keywords, 0);
 		unregister_null_strvec_handler();
@@ -2545,13 +2930,51 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void))
 						      , block_depth, EOB, BOB);
 	}
 
+	if (write_conf_copy) {
+		fflush(conf_copy);
+		write_conf_copy = false;
+
+		/* Set file offset to beginning ready for next write */
+		rewind(conf_copy);
+	}
+
+	if (prog_type != PROG_TYPE_PARENT && !__test_bit(CONFIG_TEST_BIT, &debug))
+		kill(getppid(), SIGPWR);
+
 	/* Close the password database if it was opened */
 	endpwent();
 
 	free_keywords(keywords);
 	free_parser_data();
-#ifdef _WITH_VRRP_
-	clear_rt_names();
-#endif
+
 	notify_resource_release();
+}
+
+void
+truncate_config_copy(void)
+{
+#ifndef LEAVE_FILE
+	if (conf_copy && ftruncate(fileno(conf_copy), 0))
+		log_message(LOG_INFO, "Failed to truncate config copy file (%d) - %m", errno);
+#endif
+}
+
+int
+get_config_fd(void)
+{
+	if (!conf_copy)
+		return -1;
+
+	return fileno(conf_copy);
+}
+
+void
+set_config_fd(int fd)
+{
+	conf_copy = fdopen(fd, "w");
+	if (conf_copy) {
+		write_conf_copy = true;
+		rewind(conf_copy);
+	} else
+		log_message(LOG_INFO, "Unable to open config copy file (%d) - %m", errno);
 }

@@ -123,11 +123,14 @@ typedef struct _data {
 	notify_script_t			*shutdown_script;
 	unsigned			shutdown_script_timeout;
 #ifndef _ONE_PROCESS_DEBUG_
+	const char			*reload_check_config;	/* log file name for validating new configuration before reloading */
 	const char			*reload_time_file;
 	bool				reload_repeat;
 	time_t				reload_time;
 	bool				reload_date_specified;
+	const char			*reload_file;
 #endif
+	const char 			*config_directory;
 #ifdef _WITH_VRRP_
 	bool				dynamic_interfaces;
 	bool				allow_if_changes;
@@ -157,6 +160,10 @@ typedef struct _data {
 	unsigned			vrrp_garp_lower_prio_rep;
 	unsigned			vrrp_garp_interval;
 	unsigned			vrrp_gna_interval;
+#ifdef _HAVE_VRRP_VMAC_
+	unsigned			vrrp_vmac_garp_intvl;
+	bool				vrrp_vmac_garp_all_if;
+#endif
 	bool				vrrp_lower_prio_no_advert;
 	bool				vrrp_higher_prio_send_advert;
 	int				vrrp_version;		/* VRRP version (2 or 3) */
@@ -270,6 +277,10 @@ typedef struct _data {
 	int				vrrp_rx_bufs_multiples;
 	unsigned			vrrp_startup_delay;
 	bool				log_unknown_vrids;
+#ifdef _HAVE_VRRP_VMAC_
+	const char			*vmac_prefix;
+	const char			*vmac_addr_prefix;
+#endif
 #endif
 } data_t;
 

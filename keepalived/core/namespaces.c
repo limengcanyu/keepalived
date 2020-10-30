@@ -208,6 +208,9 @@ setns(int fd, int nstype)
 #include "memory.h"
 #include "logger.h"
 #include "pidfile.h"
+#include "utils.h"
+#include "bitops.h"
+
 
 /* Local data */
 static const char *netns_dir = RUN_DIR "netns/";
@@ -223,6 +226,8 @@ free_dirname(void)
 static void
 set_run_mount(const char *net_namespace)
 {
+	bool error;
+
 	/* /run/keepalived/NAMESPACE */
 	mount_dirname = MALLOC(strlen(KEEPALIVED_PID_DIR) + 1 + strlen(net_namespace));
 	if (!mount_dirname) {
@@ -233,7 +238,17 @@ set_run_mount(const char *net_namespace)
 	strcpy(mount_dirname, KEEPALIVED_PID_DIR);
 	strcat(mount_dirname, net_namespace);
 
-	if (mkdir(mount_dirname, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) && errno != EEXIST) {
+	/* We want the directory to have rwxr-xr-x permissions */
+	if (umask_val & (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH))
+		umask(umask_val & ~(S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
+
+	error = mkdir(mount_dirname, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) && errno != EEXIST;
+
+	/* Restore our default umask */
+	if (umask_val & (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH))
+		umask(umask_val);
+
+	if (error) {
 		log_message(LOG_INFO, "Unable to create directory %s", mount_dirname);
 		free_dirname();
 		return;
@@ -294,7 +309,8 @@ set_namespaces(const char* net_namespace)
 
 	close(fd);
 
-	set_run_mount(net_namespace);
+	if (!__test_bit(CONFIG_TEST_BIT, &debug))
+		set_run_mount(net_namespace);
 
 	FREE_PTR(netns_path);
 	netns_path = NULL;

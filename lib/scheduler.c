@@ -364,6 +364,14 @@ save_cmd_line_options(int argc, char * const *argv)
 	sav_argv = argv;
 }
 
+char * const *
+get_cmd_line_options(int *argc)
+{
+	*argc = sav_argc;
+	return sav_argv;
+}
+
+
 static const char *
 get_end(const char *str, size_t max_len)
 {
@@ -884,10 +892,24 @@ thread_destroy_list(thread_master_t *m, list_head_t *l)
 	thread_t *thread, *thread_tmp;
 
 	list_for_each_entry_safe(thread, thread_tmp, l, e_list) {
-		if (thread->event) {
-			thread_del_read(thread);
-			thread_del_write(thread);
+		/* The following thread types are relevant for the ready list */
+		if (thread->type == THREAD_READY_READ_FD ||
+		    thread->type == THREAD_READY_WRITE_FD ||
+		    thread->type == THREAD_READ_TIMEOUT ||
+		    thread->type == THREAD_WRITE_TIMEOUT ||
+		    thread->type == THREAD_READ_ERROR ||
+		    thread->type == THREAD_WRITE_ERROR) {
+			/* Do we have a thread_event, and does it need deleting? */
+			if (thread->event) {
+				thread_del_read(thread);
+				thread_del_write(thread);
+			}
+
+			/* Do we have a file descriptor that needs closing ? */
+			if (thread->u.f.close_on_reload)
+				thread_close_fd(thread);
 		}
+
 		list_del_init(&thread->e_list);
 		thread_add_unuse(m, thread);
 	}
@@ -901,14 +923,9 @@ thread_destroy_rb(thread_master_t *m, rb_root_cached_t *root)
 	rb_for_each_entry_safe_cached(thread, thread_tmp, root, n) {
 		rb_erase_cached(&thread->n, root);
 
+		/* The following are relevant for the read and write rb lists */
 		if (thread->type == THREAD_READ ||
-		    thread->type == THREAD_WRITE ||
-		    thread->type == THREAD_READY_READ_FD ||
-		    thread->type == THREAD_READY_WRITE_FD ||
-		    thread->type == THREAD_READ_TIMEOUT ||
-		    thread->type == THREAD_WRITE_TIMEOUT ||
-		    thread->type == THREAD_READ_ERROR ||
-		    thread->type == THREAD_WRITE_ERROR) {
+		    thread->type == THREAD_WRITE) {
 			/* Do we have a thread_event, and does it need deleting? */
 			if (thread->type == THREAD_READ)
 				thread_del_read(thread);
@@ -1812,6 +1829,11 @@ thread_fetch_next_queue(thread_master_t *m)
 
 			ep_ev = &m->epoll_events[i];
 			ev = ep_ev->data.ptr;
+
+#ifdef _EPOLL_DEBUG_
+			if (do_epoll_debug)
+				log_message(LOG_INFO, "Handling event 0x%x for fd %d", ep_ev->events, ev->fd);
+#endif
 
 			/* Error */
 			if (ep_ev->events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {

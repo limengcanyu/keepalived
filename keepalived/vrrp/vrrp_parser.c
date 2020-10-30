@@ -380,6 +380,22 @@ vrrp_sg_tracking_weight_handler(__attribute__((unused)) const vector_t *strvec)
 	vgroup->sgroup_tracking_weight = true;
 }
 static void
+vrrp_sg_notify_priority_changes_handler(const vector_t *strvec)
+{
+	vrrp_sgroup_t *vgroup = list_last_entry(&vrrp_data->vrrp_sync_group, vrrp_sgroup_t, e_list);
+	int res = true;
+
+	if (vector_size(strvec) >= 2) {
+		res = check_true_false(strvec_slot(strvec,1));
+		if (res < 0) {
+			report_config_error(CONFIG_GENERAL_ERROR, "(%s) Invalid value '%s' for sync group notify_priority_changes specified", vgroup->gname, strvec_slot(strvec, 1));
+			return;
+		}
+	}
+
+	vgroup->notify_priority_changes = res;
+}
+static void
 vrrp_handler(const vector_t *strvec)
 {
 	vrrp_t *vrrp;
@@ -416,9 +432,14 @@ vrrp_end_handler(void)
 
 #ifdef _HAVE_VRRP_VMAC_
 	if (!list_empty(&vrrp->unicast_peer) && vrrp->vmac_flags) {
-		report_config_error(CONFIG_GENERAL_ERROR, "(%s): Cannot use VMAC/ipvlan with unicast peers - clearing use_vmac", vrrp->iname);
-		vrrp->vmac_flags = 0;
-		vrrp->vmac_ifname[0] = '\0';
+		if (!vrrp->ifp) {
+			report_config_error(CONFIG_GENERAL_ERROR, "(%s): Cannot use VMAC/ipvlan with unicast peers and no interface - clearing use_vmac", vrrp->iname);
+			vrrp->vmac_flags = 0;
+			vrrp->vmac_ifname[0] = '\0';
+		} else if (!__test_bit(VRRP_VMAC_XMITBASE_BIT, &vrrp->vmac_flags)) {
+			report_config_error(CONFIG_GENERAL_ERROR, "(%s) unicast with use_vmac requires vmac_xmit_base - setting", vrrp->iname);
+			__set_bit(VRRP_VMAC_XMITBASE_BIT, &vrrp->vmac_flags);
+		}
 	}
 #endif
 
@@ -477,6 +498,14 @@ vrrp_vmac_handler(const vector_t *strvec)
 			vrrp->vmac_ifname[0] = '\0';
 		}
 	}
+}
+
+static void
+vrrp_vmac_addr_handler(__attribute__((unused)) const vector_t *strvec)
+{
+	vrrp_t *vrrp = list_last_entry(&vrrp_data->vrrp, vrrp_t, e_list);
+
+	__set_bit(VRRP_VMAC_ADDR_BIT, &vrrp->vmac_flags);
 }
 static void
 vrrp_vmac_xmit_base_handler(__attribute__((unused)) const vector_t *strvec)
@@ -1109,6 +1138,32 @@ vrrp_garp_lower_prio_rep_handler(const vector_t *strvec)
 
 	vrrp->garp_lower_prio_rep = garp_lower_prio_rep;
 }
+#ifdef _HAVE_VRRP_VMAC_
+static void
+vrrp_vmac_garp_intvl_handler(const vector_t *strvec)
+{
+	vrrp_t *vrrp = list_last_entry(&vrrp_data->vrrp, vrrp_t, e_list);
+	unsigned delay = UINT_MAX;
+	unsigned index;
+
+	for (index = 1; index < vector_size(strvec); index++) {
+		if (!strcmp(strvec_slot(strvec, index), "all"))
+			vrrp->vmac_garp_all_if = true;
+		else if (!read_unsigned_strvec(strvec, index, &delay, 0, 86400, true)) {
+			report_config_error(CONFIG_GENERAL_ERROR, "(%s): vmac_garp_intvl '%s' invalid - ignoring", vrrp->iname, strvec_slot(strvec, index));
+			return;
+		}
+	}
+
+	if (delay == UINT_MAX) {
+		report_config_error(CONFIG_GENERAL_ERROR, "(%s): vmac_garp_intvl specified without time - ignoring", vrrp->iname);
+		return;
+	}
+
+	vrrp->vmac_garp_intvl.tv_sec = delay;
+	vrrp->vmac_garp_intvl.tv_usec = 0;
+}
+#endif
 static void
 vrrp_lower_prio_no_advert_handler(const vector_t *strvec)
 {
@@ -1801,6 +1856,7 @@ init_vrrp_keywords(bool active)
 	install_keyword("smtp_alert", &vrrp_gsmtp_handler);
 	install_keyword("global_tracking", &vrrp_gglobal_tracking_handler);
 	install_keyword("sync_group_tracking_weight", &vrrp_sg_tracking_weight_handler);
+	install_keyword("notify_priority_changes", &vrrp_sg_notify_priority_changes_handler);
 
 	/* Garp declarations */
 	install_keyword_root("garp_group", &garp_group_handler, active);
@@ -1820,6 +1876,7 @@ init_vrrp_keywords(bool active)
 	install_root_end_handler(&vrrp_end_handler);
 #ifdef _HAVE_VRRP_VMAC_
 	install_keyword("use_vmac", &vrrp_vmac_handler);
+	install_keyword("use_vmac_addr", &vrrp_vmac_addr_handler);
 	install_keyword("vmac_xmit_base", &vrrp_vmac_xmit_base_handler);
 #endif
 #ifdef _HAVE_VRRP_IPVLAN_
@@ -1889,6 +1946,9 @@ init_vrrp_keywords(bool active)
 	install_keyword("garp_master_refresh_repeat", &vrrp_garp_refresh_rep_handler);
 	install_keyword("garp_lower_prio_delay", &vrrp_garp_lower_prio_delay_handler);
 	install_keyword("garp_lower_prio_repeat", &vrrp_garp_lower_prio_rep_handler);
+#ifdef _HAVE_VRRP_VMAC_
+	install_keyword("vmac_garp_intvl", &vrrp_vmac_garp_intvl_handler);
+#endif
 	install_keyword("lower_prio_no_advert", &vrrp_lower_prio_no_advert_handler);
 	install_keyword("higher_prio_send_advert", &vrrp_higher_prio_send_advert_handler);
 	install_keyword("kernel_rx_buf_size", &kernel_rx_buf_size_handler);
